@@ -6,3 +6,4 @@ __pycache__
 /gpt/__pycache__
 /gpt/data/shakespeare/*bin
 /gpt/data/shakespeare/input.txt
+.gitignore
