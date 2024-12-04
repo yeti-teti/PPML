@@ -11,51 +11,82 @@ from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
 
+import opacus
+from opacus import PrivacyEngine
+from opacus.grad_sample import GradSampleModule
+from opacus.grad_sample import register_grad_sampler
+
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 out_dir = 'out'
-eval_interval = 2000
+#eval_interval = 2000
+eval_interval = 10
 log_interval = 1
-eval_iters = 200
+#eval_iters = 200
+eval_iters = 5
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
-# wandb logging
-wandb_log = False # disabled by default
-wandb_project = 'owt'
-wandb_run_name = 'gpt2' # 'run' + str(time.time())
+
+
 # data
-# dataset = 'openwebtext'
 dataset = 'shakespeare'
-gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
+#gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
+gradient_accumulation_steps = 1 # Must be 1 for differential privacy
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
+
+
 # model
 n_layer = 12
 n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+
+
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
-max_iters = 600000 # total number of training iterations
+#max_iters = 600000 # total number of training iterations
+max_iters = 40
+
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
+
+
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
-warmup_iters = 2000 # how many steps to warm up for
-lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
+#warmup_iters = 2000 # how many steps to warm up for
+warmup_iters = 20
+
+#lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
+lr_decay_iters = 40
+
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
+
+
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
-#device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
-device = 'cpu'
+device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
+
+
+# Differential Privacy Parameters
+use_dp = True # Set true to enable differential privacy
+target_epsilon = 10 # Desired epsilon
+target_delta = 1e-5 # Desired Delta
+max_grad_norm = 1.0 # Clip per-sample gradients to this norm
+noise_multiplier = 1.1 # Noise multiplier for DP-SGD
+num_epochs = 1 # Number of training epochs
+
+
+
+
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 #exec(open('configurator.py').read()) # overrides from command line or config file
@@ -95,24 +126,47 @@ device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.aut
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
-# poor man's data loader
+# Loading Data
 data_dir = os.path.join('data', dataset)
-def get_batch(split):
-    # We recreate np.memmap every batch to avoid a memory leak, as per
-    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
-    if split == 'train':
-        data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-    else:
-        data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
-    if device_type == 'cuda':
-        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
-    else:
-        x, y = x.to(device), y.to(device)
-    return x, y
+
+# Create custom Dataset
+class ShakespeareDataset(torch.utils.data.Dataset):
+    def __init__(self, split):
+        data_file = 'train.bin' if split == 'train' else 'val.bin'
+        self.data = np.memmap(os.path.join(data_dir, data_file), dtype=np.uint16, mode = 'r')
+        self.block_size = block_size
+        self.length = len(self.data) - self.block_size
+
+    def __len__(self):
+        return self.length
+    
+    def __getitem__(self, idx):
+        x = torch.from_numpy(self.data[idx:idx + self.block_size].astype(np.int64))
+        y = torch.from_numpy(self.data[idx + 1:idx + 1 + self.block_size].astype(np.int64))
+        return x, y
+    
+
+train_dataset = ShakespeareDataset('train')
+val_dataset = ShakespeareDataset('val')
+
+train_loader = torch.utils.data.DataLoader(
+    train_dataset, 
+    batch_size=batch_size, 
+    shuffle=True, 
+    num_workers=0,
+    pin_memory=True,
+)  
+
+val_loader = torch.utils.data.DataLoader(
+    val_dataset, 
+    batch_size=batch_size, 
+    shuffle=False, 
+    num_workers=0, 
+    pin_memory=True,
+)
+
+total_samples = len(train_dataset)
+
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
@@ -195,21 +249,42 @@ if compile:
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 
+
+# Attach PrivacyEngine
+if use_dp:
+    # Wrap the model with GradSampleModule
+    model = GradSampleModule(model)
+    privacy_engine = PrivacyEngine(
+        model,
+        batch_size=batch_size * ddp_world_size,
+        sample_size=total_samples,
+        max_grad_norm=max_grad_norm,
+        noise_multiplier=noise_multiplier,
+        target_delta=target_delta,
+    )
+    privacy_engine.attach(optimizer)
+
+
+
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
 def estimate_loss():
     out = {}
     model.eval()
-    for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters)
-        for k in range(eval_iters):
-            X, Y = get_batch(split)
+    for split, data_loader in [('train', train_loader), ('val', val_loader)]:
+        losses = []
+        for k, (X, Y) in enumerate(data_loader):
+            if k >= eval_iters:
+                break
+            X = X.to(device)
+            Y = Y.to(device)
             with ctx:
                 logits, loss = model(X, Y)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
+            losses.append(loss.item())
+        out[split] = np.mean(losses)
     model.train()
     return out
+
 
 # learning rate decay scheduler (cosine with warmup)
 def get_lr(it):
@@ -227,24 +302,63 @@ def get_lr(it):
 
 
 
-# training loop
-X, Y = get_batch('train') # fetch the very first batch
+# Training loop
 t0 = time.time()
-local_iter_num = 0 # number of iterations in the lifetime of this process
-raw_model = model.module if ddp else model # unwrap DDP container if needed
+local_iter_num = 0  # Number of iterations in the lifetime of this process
+raw_model = model.module if ddp else model  # Unwrap DDP container if needed
 running_mfu = -1.0
-while True:
+iter_num = 0
 
-    # determine and set the learning rate for this iteration
-    lr = get_lr(iter_num) if decay_lr else learning_rate
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
+for epoch in range(num_epochs):
+    for X, Y in train_loader:
+        iter_num += 1
+        # Determine and set the learning rate for this iteration
+        lr = get_lr(iter_num) if decay_lr else learning_rate
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
 
-    # evaluate the loss on train/val sets and write checkpoints
-    if iter_num % eval_interval == 0 and master_process:
+        X = X.to(device)
+        Y = Y.to(device)
+
+        # Forward and backward pass
+        if ddp:
+            model.require_backward_grad_sync = True
+        with ctx:
+            logits, loss = model(X, Y)
+
+        # Backward pass with gradient scaling if training in fp16
+        optimizer.zero_grad()
+        scaler.scale(loss).backward()
+
+        # Clip the gradient
+        if grad_clip != 0.0 and not use_dp:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
+        # Step the optimizer and scaler if training in fp16
+        scaler.step(optimizer)
+        scaler.update()
+
+        # Timing and logging
+        t1 = time.time()
+        dt = t1 - t0
+        t0 = t1
+        if iter_num % log_interval == 0 and master_process:
+            lossf = loss.item()
+            if local_iter_num >= 5:
+                mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
+                running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
+            print(f"iter {iter_num}: loss {lossf:.4f}, time {dt * 1000:.2f}ms, mfu {running_mfu * 100:.2f}%")
+        local_iter_num += 1
+
+    # Evaluate after each epoch
+    if master_process:
         losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-        
+        print(f"Epoch {epoch}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        if use_dp:
+            epsilon, best_alpha = privacy_engine.get_epsilon(target_delta)
+            print(f"Epoch {epoch}: ε = {epsilon:.2f}, δ = {target_delta}")
+
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
             if iter_num > 0:
@@ -256,55 +370,12 @@ while True:
                     'best_val_loss': best_val_loss,
                     'config': config,
                 }
-                print(f"saving checkpoint to {out_dir}")
+                print(f"Saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
-    if iter_num == 0 and eval_only:
-        break
 
-    # forward backward update, with optional gradient accumulation to simulate larger batch size
-    # and using the GradScaler if data type is float16
-    for micro_step in range(gradient_accumulation_steps):
-        if ddp:
-            # in DDP training we only need to sync gradients at the last micro step.
-            # the official way to do this is with model.no_sync() context manager, but
-            # I really dislike that this bloats the code and forces us to repeat code
-            # looking at the source of that context manager, it just toggles this variable
-            model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
-        with ctx:
-            logits, loss = model(X, Y)
-            loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
-        # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y = get_batch('train')
-        # backward pass, with gradient scaling if training in fp16
-        scaler.scale(loss).backward()
-    # clip the gradient
-    if grad_clip != 0.0:
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-    # step the optimizer and scaler if training in fp16
-    scaler.step(optimizer)
-    scaler.update()
-    # flush the gradients as soon as we can, no need for this memory anymore
-    optimizer.zero_grad(set_to_none=True)
-
-    # timing and logging
-    t1 = time.time()
-    dt = t1 - t0
-    t0 = t1
-    if iter_num % log_interval == 0 and master_process:
-        # get loss as float. note: this is a CPU-GPU sync point
-        # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
-        lossf = loss.item() * gradient_accumulation_steps
-        if local_iter_num >= 5: # let the training loop settle a bit
-            mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
-            running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
-    iter_num += 1
-    local_iter_num += 1
-
-    # termination conditions
-    if iter_num > max_iters:
-        break
+# Detach privacy engine
+if use_dp:
+    privacy_engine.detach()
 
 if ddp:
     destroy_process_group()

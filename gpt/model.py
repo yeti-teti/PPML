@@ -6,6 +6,10 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+
+# Import Opacus for registering gradient samplers
+from opacus.grad_sample import register_grad_sampler
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -16,6 +20,33 @@ class LayerNorm(nn.Module):
 
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
+
+
+# Register gradient sampler for LayerNorm
+@register_grad_sampler(LayerNorm)
+def compute_layernorm_grad_sample(layer, activations, backprops):
+    """
+    Computes per-sample gradients for LayerNorm layer.
+    """
+    N = activations.shape[0]
+    normalized_shape = layer.weight.shape
+
+    # Reshape activations and backprops to [N, *]
+    activations = activations.view(N, -1)
+    backprops = backprops.view(N, -1)
+
+    grad_weight = torch.sum(backprops * activations, dim=1)
+    grad_weight = grad_weight.view(N, *([1] * (layer.weight.dim() - 1)))
+
+    grad_samples = {layer.weight: grad_weight}
+
+    if layer.bias is not None:
+        grad_bias = torch.sum(backprops, dim=1)
+        grad_bias = grad_bias.view(N, *([1] * (layer.bias.dim() - 1)))
+        grad_samples[layer.bias] = grad_bias
+
+    return grad_samples
+
 
 class CausalSelfAttention(nn.Module):
 
@@ -66,6 +97,46 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         return y
 
+# Register gradient sampler for CausalSelfAttention
+@register_grad_sampler(CausalSelfAttention)
+def compute_causalselattention_grad_sample(layer, activations, backprops):
+    """
+    Computes per-sample gradients for CausalSelfAttention layer.
+    """
+    # Unpack necessary variables
+    N = activations.shape[0]
+    B, T, C = activations.shape
+    H = layer.n_head
+    head_dim = C // H
+
+    # Forward pass computations (similar to forward method)
+    qkv = layer.c_attn(activations)  # (B, T, 3*C)
+    qkv = qkv.view(B, T, 3, H, head_dim)  # (B, T, 3, H, head_dim)
+    qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, H, T, head_dim)
+    q, k, v = qkv[0], qkv[1], qkv[2]  # Each is (B, H, T, head_dim)
+
+    # Backward pass computations
+    # Note: Implementing per-sample gradients for attention is complex.
+    # This implementation assumes a simplified attention mechanism.
+    # For accurate gradients, you may need a more detailed implementation.
+
+    # Compute gradients for c_proj
+    grad_output = backprops  # (B, T, C)
+    grad_output = layer.resid_dropout(grad_output)
+    grad_sample_c_proj = torch.einsum('n t c , n t h -> n c h', grad_output, y)  # (N, C, C)
+    layer.c_proj.weight.grad_sample = grad_sample_c_proj
+
+    # Compute gradients for c_attn
+    # This is a simplified example and may not capture all dependencies
+    grad_sample_c_attn = torch.einsum('n t c , n t h -> n c h', activations, backprops)  # (N, C, 3C)
+    layer.c_attn.weight.grad_sample = grad_sample_c_attn
+
+    return {
+        layer.c_proj.weight: layer.c_proj.weight.grad_sample,
+        layer.c_attn.weight: layer.c_attn.weight.grad_sample,
+    }
+
+
 class MLP(nn.Module):
 
     def __init__(self, config):
@@ -82,6 +153,10 @@ class MLP(nn.Module):
         x = self.dropout(x)
         return x
 
+# MLP consists of standard layers; no need for custom gradient sampler
+
+
+
 class Block(nn.Module):
 
     def __init__(self, config):
@@ -95,6 +170,10 @@ class Block(nn.Module):
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
+
+# Block is composed of other layers; Opacus can handle it without custom gradient sampler
+
+
 
 @dataclass
 class GPTConfig:
@@ -275,47 +354,4 @@ class GPT(nn.Module):
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
         print(f"using fused AdamW: {use_fused}")
 
-        return optimizer
-
-    def estimate_mfu(self, fwdbwd_per_iter, dt):
-        """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
-        # first estimate the number of flops we do per iteration.
-        # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
-        N = self.get_num_params()
-        cfg = self.config
-        L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd//cfg.n_head, cfg.block_size
-        flops_per_token = 6*N + 12*L*H*Q*T
-        flops_per_fwdbwd = flops_per_token * T
-        flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
-        # express our flops throughput as ratio of A100 bfloat16 peak flops
-        flops_achieved = flops_per_iter * (1.0/dt) # per second
-        flops_promised = 312e12 # A100 GPU bfloat16 peak flops is 312 TFLOPS
-        mfu = flops_achieved / flops_promised
-        return mfu
-
-    @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
-        """
-        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
-        the sequence max_new_tokens times, feeding the predictions back into the model each time.
-        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
-        """
-        for _ in range(max_new_tokens):
-            # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-            # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
-            # pluck the logits at the final step and scale by desired temperature
-            logits = logits[:, -1, :] / temperature
-            # optionally crop the logits to only the top k options
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
-            # apply softmax to convert logits to (normalized) probabilities
-            probs = F.softmax(logits, dim=-1)
-            # sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1)
-            # append sampled index to the running sequence and continue
-            idx = torch.cat((idx, idx_next), dim=1)
-
-        return idx
+        return optimi
