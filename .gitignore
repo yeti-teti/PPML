@@ -1,7 +1,8 @@
 __pycache__
 /data
-/papers
+/Papers
 /log
-Todo
-ideas.txt
 /TODOs
+/gpt/__pycache__
+/gpt/data/shakespeare/*bin
+/gpt/data/shakespeare/input.txt
