@@ -1,0 +1,8 @@
+torch
+transformers
+scikit-learn
+torch
+torchvision
+torchaudio
+datasets
+numpy
