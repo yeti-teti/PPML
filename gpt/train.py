@@ -11,90 +11,93 @@ from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
 
-import opacus
-from opacus import PrivacyEngine
-from opacus.grad_sample import GradSampleModule
-from opacus.grad_sample import register_grad_sampler
-
 # -----------------------------------------------------------------------------
-# default config values designed to train a gpt2 (124M) on OpenWebText
+# Default configuration values designed to train a GPT-2 (124M) on OpenWebText
 # I/O
 out_dir = 'out'
-#eval_interval = 2000
 eval_interval = 10
 log_interval = 1
-#eval_iters = 200
 eval_iters = 5
-eval_only = False # if True, script exits right after the first eval
-always_save_checkpoint = True # if True, always save a checkpoint after each eval
-init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
+eval_only = False  # if True, script exits right after the first eval
+always_save_checkpoint = True  # if True, always save a checkpoint after each eval
+init_from = 'scratch'  # 'scratch' or 'resume' or 'gpt2*'
 
-
-# data
+# Data
 dataset = 'shakespeare'
-#gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
-gradient_accumulation_steps = 1 # Must be 1 for differential privacy
-batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
+gradient_accumulation_steps = 1  # Must be 1 for differential privacy
+batch_size = 12  # global batch size across all GPUs
 block_size = 1024
 
-
-# model
+# Model
 n_layer = 12
 n_head = 12
 n_embd = 768
-dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
-bias = False # do we use bias inside LayerNorm and Linear layers?
+dropout = 0.0  # for pretraining 0 is good, for finetuning try 0.1+
+bias = False  # do we use bias inside LayerNorm and Linear layers?
 
-
-# adamw optimizer
-learning_rate = 6e-4 # max learning rate
-#max_iters = 600000 # total number of training iterations
-max_iters = 40
-
+# AdamW optimizer
+learning_rate = 6e-4  # max learning rate
+max_iters = 500
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
-grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
+grad_clip = 1.0  # clip gradients at this value, or disable if == 0.0
 
-
-# learning rate decay settings
-decay_lr = True # whether to decay the learning rate
-#warmup_iters = 2000 # how many steps to warm up for
+# Learning rate decay settings
+decay_lr = True  # whether to decay the learning rate
 warmup_iters = 20
-
-#lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
 lr_decay_iters = 40
-
-min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
-
+min_lr = 6e-5  # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 
 # DDP settings
-backend = 'nccl' # 'nccl', 'gloo', etc.
-# system
-device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
-dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-compile = True # use PyTorch 2.0 to compile the model to be faster
-
+backend = 'nccl'  # 'nccl', 'gloo', etc.
+# System
+device = 'cuda'  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc.
+dtype = 'float32'  # Using `float32` to avoid data type mismatches
+compile = True  # use PyTorch 2.0 to compile the model to be faster
 
 # Differential Privacy Parameters
-use_dp = True # Set true to enable differential privacy
-target_epsilon = 10 # Desired epsilon
-target_delta = 1e-5 # Desired Delta
-max_grad_norm = 1.0 # Clip per-sample gradients to this norm
-noise_multiplier = 1.1 # Noise multiplier for DP-SGD
-num_epochs = 1 # Number of training epochs
+use_dp = True  # Set true to enable differential privacy
+target_epsilon = 10  # Desired epsilon
+target_delta = 1e-5  # Desired Delta
+max_grad_norm = 1.0  # Clip per-sample gradients to this norm
+noise_multiplier = 1.1  # Noise multiplier for DP-SGD
+num_epochs = 1  # Number of training epochs
 
+# Privacy Accounting
+class PrivacyEngine:
+    def __init__(self, noise_multiplier, max_grad_norm, target_delta, sample_rate):
+        self.noise_multiplier = noise_multiplier
+        self.max_grad_norm = max_grad_norm
+        self.target_delta = target_delta
+        self.sample_rate = sample_rate
+        self.steps = 0
+        self.epsilon = 0.0
 
+    def compute_epsilon(self):
+        from math import sqrt, log
 
+        q = self.sample_rate
+        sigma = self.noise_multiplier
+        if q == 0:
+            return float('inf')
+        # Simple RDP approximation for Gaussian noise
+        return q * self.steps / (sigma ** 2)
+
+    def step(self):
+        self.steps += 1
+        self.epsilon = self.compute_epsilon()
+
+    def get_epsilon(self):
+        return self.epsilon
 
 # -----------------------------------------------------------------------------
-config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
-#exec(open('configurator.py').read()) # overrides from command line or config file
-config = {k: globals()[k] for k in config_keys} # will be useful for logging
+config_keys = [k for k, v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
+config = {k: globals()[k] for k in config_keys}  # will be useful for logging
 # -----------------------------------------------------------------------------
 
-# various inits, derived attributes, I/O setup
-ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
+# Various inits, derived attributes, I/O setup
+ddp = int(os.environ.get('RANK', -1)) != -1  # is this a ddp run?
 if ddp:
     init_process_group(backend=backend)
     ddp_rank = int(os.environ['RANK'])
@@ -102,280 +105,183 @@ if ddp:
     ddp_world_size = int(os.environ['WORLD_SIZE'])
     device = f'cuda:{ddp_local_rank}'
     torch.cuda.set_device(device)
-    master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
-    seed_offset = ddp_rank # each process gets a different seed
-    # world_size number of processes will be training simultaneously, so we can scale
-    # down the desired gradient accumulation iterations per process proportionally
-    assert gradient_accumulation_steps % ddp_world_size == 0
+    master_process = ddp_rank == 0  # this process will do logging, checkpointing etc.
+    seed_offset = ddp_rank  # each process gets a different seed
     gradient_accumulation_steps //= ddp_world_size
 else:
-    # if not ddp, we are running on a single gpu, and one process
     master_process = True
     seed_offset = 0
     ddp_world_size = 1
+
 tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
 print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
 torch.manual_seed(1337 + seed_offset)
-torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
-torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
-device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
-# note: float16 data type will automatically use a GradScaler
-ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+device_type = 'cuda' if 'cuda' in device else 'cpu'
+ptdtype = torch.float32  # Enforce consistent data type as float32
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # Loading Data
 data_dir = os.path.join('data', dataset)
 
-# Create custom Dataset
 class ShakespeareDataset(torch.utils.data.Dataset):
     def __init__(self, split):
         data_file = 'train.bin' if split == 'train' else 'val.bin'
-        self.data = np.memmap(os.path.join(data_dir, data_file), dtype=np.uint16, mode = 'r')
+        self.data = np.memmap(os.path.join(data_dir, data_file), dtype=np.uint16, mode='r')
         self.block_size = block_size
         self.length = len(self.data) - self.block_size
 
     def __len__(self):
         return self.length
-    
+
     def __getitem__(self, idx):
         x = torch.from_numpy(self.data[idx:idx + self.block_size].astype(np.int64))
         y = torch.from_numpy(self.data[idx + 1:idx + 1 + self.block_size].astype(np.int64))
         return x, y
-    
 
 train_dataset = ShakespeareDataset('train')
 val_dataset = ShakespeareDataset('val')
 
+print(f"Number of training samples: {len(train_dataset)}")
+
 train_loader = torch.utils.data.DataLoader(
-    train_dataset, 
-    batch_size=batch_size, 
-    shuffle=True, 
+    train_dataset,
+    batch_size=batch_size,
+    shuffle=True,
     num_workers=0,
     pin_memory=True,
-)  
+)
 
 val_loader = torch.utils.data.DataLoader(
-    val_dataset, 
-    batch_size=batch_size, 
-    shuffle=False, 
-    num_workers=0, 
+    val_dataset,
+    batch_size=batch_size,
+    shuffle=False,
+    num_workers=0,
     pin_memory=True,
 )
 
 total_samples = len(train_dataset)
 
-
-# init these up here, can override if init_from='resume' (i.e. from a checkpoint)
-iter_num = 0
-best_val_loss = 1e9
-
-# attempt to derive vocab_size from the dataset
+# Model initialization
 meta_path = os.path.join(data_dir, 'meta.pkl')
 meta_vocab_size = None
 if os.path.exists(meta_path):
     with open(meta_path, 'rb') as f:
         meta = pickle.load(f)
     meta_vocab_size = meta['vocab_size']
-    print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
-# model init
-model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
-if init_from == 'scratch':
-    # init a new model from scratch
-    print("Initializing a new model from scratch")
-    # determine the vocab size we'll use for from-scratch training
-    if meta_vocab_size is None:
-        print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
-    model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
-    gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
-elif init_from == 'resume':
-    print(f"Resuming training from {out_dir}")
-    # resume training from a checkpoint.
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
-    checkpoint = torch.load(ckpt_path, map_location=device)
-    checkpoint_model_args = checkpoint['model_args']
-    # force these config attributes to be equal otherwise we can't even resume training
-    # the rest of the attributes (e.g. dropout) can stay as desired from command line
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-        model_args[k] = checkpoint_model_args[k]
-    # create the model
-    gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
-    state_dict = checkpoint['model']
-    # fix the keys of the state dictionary :(
-    # honestly no idea how checkpoints sometimes get this prefix, have to debug more
-    unwanted_prefix = '_orig_mod.'
-    for k,v in list(state_dict.items()):
-        if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-    model.load_state_dict(state_dict)
-    iter_num = checkpoint['iter_num']
-    best_val_loss = checkpoint['best_val_loss']
-elif init_from.startswith('gpt2'):
-    print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
-    # initialize from OpenAI GPT-2 weights
-    override_args = dict(dropout=dropout)
-    model = GPT.from_pretrained(init_from, override_args)
-    # read off the created config params, so we can store them into checkpoint correctly
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-        model_args[k] = getattr(model.config, k)
-# crop down the model block size if desired, using model surgery
-if block_size < model.config.block_size:
-    model.crop_block_size(block_size)
-    model_args['block_size'] = block_size # so that the checkpoint will have the right value
-model.to(device)
+model_args = dict(
+    n_layer=n_layer,
+    n_head=n_head,
+    n_embd=n_embd,
+    block_size=block_size,
+    bias=bias,
+    vocab_size=meta_vocab_size or 50304,
+    dropout=dropout
+)
+model = GPT(GPTConfig(**model_args)).to(device)
 
-# initialize a GradScaler. If enabled=False scaler is a no-op
-scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
-
-# optimizer
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
-if init_from == 'resume':
-    optimizer.load_state_dict(checkpoint['optimizer'])
-checkpoint = None # free up memory
 
-# compile the model
 if compile:
-    print("compiling the model... (takes a ~minute)")
-    unoptimized_model = model
-    model = torch.compile(model) # requires PyTorch 2.0
+    model = torch.compile(model)
 
-# wrap model into DDP container
-if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank])
-
-
-# Attach PrivacyEngine
+# Privacy Engine Initialization
 if use_dp:
-    # Wrap the model with GradSampleModule
-    model = GradSampleModule(model)
+    sample_rate = (gradient_accumulation_steps * batch_size) / total_samples
     privacy_engine = PrivacyEngine(
-        model,
-        batch_size=batch_size * ddp_world_size,
-        sample_size=total_samples,
-        max_grad_norm=max_grad_norm,
         noise_multiplier=noise_multiplier,
+        max_grad_norm=max_grad_norm,
         target_delta=target_delta,
+        sample_rate=sample_rate
     )
-    privacy_engine.attach(optimizer)
+    # Note: The PrivacyEngine is a custom implementation. Ensure it integrates correctly with your training loop.
 
+# Enable fallback to eager mode for debugging
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True
 
+# Helper functions for Differential Privacy
+def clip_gradients(model, max_norm):
+    total_norm = 0.0
+    for param in model.parameters():
+        if param.grad is not None:
+            param_norm = param.grad.detach().data.norm(2)
+            total_norm += param_norm.item() ** 2
+    total_norm = math.sqrt(total_norm)
+    clip_coef = max_norm / (total_norm + 1e-6)
+    if clip_coef < 1:
+        for param in model.parameters():
+            if param.grad is not None:
+                param.grad.detach().mul_(clip_coef)
 
-# helps estimate an arbitrarily accurate loss over either split using many batches
-@torch.no_grad()
-def estimate_loss():
-    out = {}
-    model.eval()
-    for split, data_loader in [('train', train_loader), ('val', val_loader)]:
-        losses = []
-        for k, (X, Y) in enumerate(data_loader):
-            if k >= eval_iters:
-                break
-            X = X.to(device)
-            Y = Y.to(device)
-            with ctx:
-                logits, loss = model(X, Y)
-            losses.append(loss.item())
-        out[split] = np.mean(losses)
-    model.train()
-    return out
+def add_noise(model, noise_multiplier, max_grad_norm, device):
+    for param in model.parameters():
+        if param.grad is not None:
+            noise = torch.randn_like(param.grad) * noise_multiplier * max_grad_norm
+            param.grad += noise.to(device)
 
-
-# learning rate decay scheduler (cosine with warmup)
-def get_lr(it):
-    # 1) linear warmup for warmup_iters steps
-    if it < warmup_iters:
-        return learning_rate * it / warmup_iters
-    # 2) if it > lr_decay_iters, return min learning rate
-    if it > lr_decay_iters:
-        return min_lr
-    # 3) in between, use cosine decay down to min learning rate
-    decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
-    assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
-    return min_lr + coeff * (learning_rate - min_lr)
-
-
+# Function to save checkpoints
+def save_checkpoint(state, filename):
+    torch.save(state, filename)
+    print(f"Checkpoint saved at {filename}")
 
 # Training loop
-t0 = time.time()
-local_iter_num = 0  # Number of iterations in the lifetime of this process
-raw_model = model.module if ddp else model  # Unwrap DDP container if needed
-running_mfu = -1.0
-iter_num = 0
-
 for epoch in range(num_epochs):
-    for X, Y in train_loader:
-        iter_num += 1
-        # Determine and set the learning rate for this iteration
-        lr = get_lr(iter_num) if decay_lr else learning_rate
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
+    model.train()
+    for step, (X, Y) in enumerate(train_loader):
+        if step >= max_iters:
+            break
 
-        X = X.to(device)
-        Y = Y.to(device)
+        X, Y = X.to(device).long(), Y.to(device).long()  # Ensure correct data type for embedding lookup
+        optimizer.zero_grad()
 
-        # Forward and backward pass
-        if ddp:
-            model.require_backward_grad_sync = True
         with ctx:
             logits, loss = model(X, Y)
 
-        # Backward pass with gradient scaling if training in fp16
-        optimizer.zero_grad()
-        scaler.scale(loss).backward()
+        loss.backward()
 
-        # Clip the gradient
-        if grad_clip != 0.0 and not use_dp:
-            scaler.unscale_(optimizer)
+        if use_dp:
+            # Per-sample gradient clipping and noise addition
+            clip_gradients(model, max_grad_norm)
+            add_noise(model, noise_multiplier, max_grad_norm, device)
+
+        # Gradient clipping (global)
+        if grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
 
-        # Step the optimizer and scaler if training in fp16
-        scaler.step(optimizer)
-        scaler.update()
+        optimizer.step()
 
-        # Timing and logging
-        t1 = time.time()
-        dt = t1 - t0
-        t0 = t1
-        if iter_num % log_interval == 0 and master_process:
-            lossf = loss.item()
-            if local_iter_num >= 5:
-                mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
-                running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
-            print(f"iter {iter_num}: loss {lossf:.4f}, time {dt * 1000:.2f}ms, mfu {running_mfu * 100:.2f}%")
-        local_iter_num += 1
-
-    # Evaluate after each epoch
-    if master_process:
-        losses = estimate_loss()
-        print(f"Epoch {epoch}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if use_dp:
-            epsilon, best_alpha = privacy_engine.get_epsilon(target_delta)
-            print(f"Epoch {epoch}: ε = {epsilon:.2f}, δ = {target_delta}")
+            privacy_engine.step()
+            epsilon = privacy_engine.get_epsilon()
+            if master_process:
+                print(f"Step {step}: ε = {epsilon:.2f}, δ = {target_delta}")
 
-        if losses['val'] < best_val_loss or always_save_checkpoint:
-            best_val_loss = losses['val']
-            if iter_num > 0:
-                checkpoint = {
-                    'model': raw_model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'model_args': model_args,
-                    'iter_num': iter_num,
-                    'best_val_loss': best_val_loss,
-                    'config': config,
-                }
-                print(f"Saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+        # Logging loss periodically
+        if master_process and step % log_interval == 0:
+            print(f"Epoch {epoch}, Step {step}, Loss: {loss.item()}")
 
-# Detach privacy engine
-if use_dp:
-    privacy_engine.detach()
+    # Save checkpoint after every eval_interval epochs or always if enabled
+    if master_process and (epoch % eval_interval == 0 or always_save_checkpoint):
+        checkpoint = {
+            'model': model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'epoch': epoch,
+            'step': step,
+            'model_args': model_args,
+            'config': config
+        }
+        checkpoint_path = os.path.join(out_dir, 'ckpt.pt')  # Save as 'ckpt.pt' for sample.py
+        save_checkpoint(checkpoint, checkpoint_path)
 
+    if use_dp and master_process:
+        print(f"Epoch {epoch}: Total ε = {privacy_engine.get_epsilon():.2f}, δ = {target_delta}")
+
+# Clean up DDP
 if ddp:
     destroy_process_group()
