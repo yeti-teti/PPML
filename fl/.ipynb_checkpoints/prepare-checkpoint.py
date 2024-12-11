@@ -81,7 +81,7 @@ def format_patient_record(patient):
     return record
 
 # FL Configuration
-NUM_CLIENTS = 3
+NUM_CLIENTS = 5
 PATIENTS_PER_CLIENT = 50
 VAL_SPLIT = 0.2  # 20% validation split
 
