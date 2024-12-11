@@ -1,8 +1,8 @@
 import os
 import torch
 import argparse
-from fl_server import PrivateServer
-from fl_client import PrivateClient
+from fl_server import FederatedServer
+from fl_client import FederatedClient
 from privacy_utils import EarlyStopping
 
 def train_federated(num_clients=3, 
@@ -18,13 +18,13 @@ def train_federated(num_clients=3,
     torch.manual_seed(1337)
     
     # Initialize server
-    print("\nInitializing private server...")
-    server = PrivateServer(noise_scale=server_noise_scale)
+    print("\nInitializing server...")
+    server = FederatedServer(noise_scale=server_noise_scale)
     
-    # Initialize clients with privacy
-    print("\nInitializing private clients...")
+    # Initialize clients
+    print("\nInitializing clients...")
     clients = [
-        PrivateClient(
+        FederatedClient(
             client_id=i,
             batch_size=batch_size,
             block_size=block_size,
@@ -56,25 +56,26 @@ def train_federated(num_clients=3,
             
             print(f"Client {client.client_id} - Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
         
-        # Aggregate models securely
-        print("\nSecurely aggregating models...")
-        client_models = [client.get_model_state() for client in clients]
-        server.aggregate_models(client_models)
-        
         # Calculate average validation loss
         avg_val_loss = sum(client_losses) / len(client_losses)
         
-        # Check for early stopping
-        if early_stopping(avg_val_loss):
-            print("\nEarly stopping triggered")
-            break
+        # Aggregate models
+        print("\nAggregating models...")
+        client_models = [client.get_model_state() for client in clients]
+        server.aggregate_models(client_models)
         
-        # Save checkpoint if improved
+        # Save best model if improved
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             server.save_model(round_num)
-            print(f"New best validation loss: {best_val_loss:.6f}")
+            print(f"New best model saved! (Val Loss: {avg_val_loss:.6f})")
         
+        # Check for early stopping
+        if early_stopping(avg_val_loss):
+            print("\nEarly stopping triggered!")
+            break
+        
+        # Round summary
         print(f"\nRound {round_num + 1} Summary:")
         print(f"Average Validation Loss: {avg_val_loss:.6f}")
         print(f"Best Validation Loss: {best_val_loss:.6f}")

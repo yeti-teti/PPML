@@ -1,9 +1,9 @@
 import torch
 from model import GPTConfig, GPT
 from dataset import create_dataloader
-from privacy_utils import PrivacyEngine, mixup_data
+from privacy_utils import PrivacyEngine
 
-class PrivateClient:
+class FederatedClient:
     def __init__(self, 
                  client_id, 
                  batch_size=4, 
@@ -24,7 +24,7 @@ class PrivateClient:
         # Initialize model and data
         self.model = self.init_model()
         self.setup_data()
-        print(f"Client {client_id} initialized with privacy protection")
+        print(f"Client {client_id} initialized (device: {self.device})")
 
     def init_model(self):
         model_args = dict(
@@ -57,34 +57,32 @@ class PrivateClient:
             betas=(0.9, 0.95),
             device_type='cuda' if 'cuda' in self.device else 'cpu'
         )
-    
+
         total_loss = 0
         num_batches = 0
-    
+
         for batch_idx, (data, target) in enumerate(self.train_loader):
-            # Move data to device first
+            # Move data to device
             data, target = data.to(self.device), target.to(self.device)
-            
-            # Apply mixup augmentation only for continuous data, not for discrete tokens
-            # Since we're working with token indices, we'll skip mixup
-            # data, target = mixup_data(data, target)  # Remove this line
-    
+
+            # Forward pass
             optimizer.zero_grad()
             output, loss = self.model(data, target)
             loss.backward()
-    
+
             # Apply differential privacy
             self.privacy_engine.clip_gradients(self.model)
             self.privacy_engine.add_noise_to_gradients(self.model)
-    
+
+            # Update weights
             optimizer.step()
-    
+
             total_loss += loss.item()
             num_batches += 1
-    
+
             if batch_idx % 10 == 0:
                 print(f'Client {self.client_id}, Batch {batch_idx}, Loss: {loss.item():.6f}')
-    
+
         avg_loss = total_loss / num_batches if num_batches > 0 else float('inf')
         return avg_loss
 
