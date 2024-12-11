@@ -45,15 +45,10 @@ def train_federated(num_clients=3,
         client_losses = []
         for client in clients:
             print(f"\nTraining Client {client.client_id}")
-            
-            # Update client with global model
             client.update_model(server.get_model_state())
-            
-            # Train and evaluate
             train_loss = client.train_epoch()
             val_loss = client.evaluate()
             client_losses.append(val_loss)
-            
             print(f"Client {client.client_id} - Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
         
         # Calculate average validation loss
@@ -64,24 +59,18 @@ def train_federated(num_clients=3,
         client_models = [client.get_model_state() for client in clients]
         server.aggregate_models(client_models)
         
+        # Save model after each round (this will overwrite previous checkpoints)
+        server.save_model(round_num)
+        
         # Save best model if improved
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            server.save_model(round_num)
             print(f"New best model saved! (Val Loss: {avg_val_loss:.6f})")
-        
-        # Check for early stopping
-        if early_stopping(avg_val_loss):
-            print("\nEarly stopping triggered!")
-            break
         
         # Round summary
         print(f"\nRound {round_num + 1} Summary:")
         print(f"Average Validation Loss: {avg_val_loss:.6f}")
         print(f"Best Validation Loss: {best_val_loss:.6f}")
-    
-    print("\nTraining completed!")
-    print(f"Best validation loss achieved: {best_val_loss:.6f}")
 
 def main():
     parser = argparse.ArgumentParser(description='Privacy-Preserving Federated Learning')

@@ -33,28 +33,23 @@ class FederatedServer:
 
     def save_model(self, round_num, path='out-fl'):
         """Save model checkpoint"""
-        os.makedirs(path, exist_ok=True)
-        
-        checkpoint = {
-            'model': self.model.state_dict(),
-            'model_args': {
-                'n_layer': self.model.config.n_layer,
-                'n_head': self.model.config.n_head,
-                'n_embd': self.model.config.n_embd,
-                'block_size': self.model.config.block_size,
-                'bias': self.model.config.bias,
-                'vocab_size': self.model.config.vocab_size,
-                'dropout': self.model.config.dropout
-            },
-            'round': round_num
-        }
-        
-        # Save best model
-        best_path = os.path.join(path, 'best_model.pt')
-        torch.save(checkpoint, best_path)
-        
-        # Save round-specific checkpoint
-        round_path = os.path.join(path, f'round_{round_num}_model.pt')
-        torch.save(checkpoint, round_path)
-        
-        print(f"Model checkpoints saved to {path}")
+        try:
+            # Create directory if it doesn't exist
+            os.makedirs(path, exist_ok=True)
+            
+            # Prepare checkpoint in the format expected by sample.py
+            checkpoint = {
+                'model': self.model.state_dict(),
+                'model_args': self.model.config.__dict__,  # This captures all config parameters
+                'round': round_num,
+            }
+            
+            # Save as ckpt.pt for compatibility with sample.py
+            ckpt_path = os.path.join(path, 'ckpt.pt')
+            torch.save(checkpoint, ckpt_path)
+            
+            print(f"Model checkpoint saved to {ckpt_path}")
+            return True
+        except Exception as e:
+            print(f"Error saving model: {e}")
+            return False

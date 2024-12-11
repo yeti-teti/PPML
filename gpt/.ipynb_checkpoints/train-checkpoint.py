@@ -14,7 +14,7 @@ from model import GPTConfig, GPT
 # -----------------------------------------------------------------------------
 # Default configuration values
 # I/O
-out_dir = 'out-medical'  # Changed output directory
+out_dir = 'out-norm'
 eval_interval = 5
 log_interval = 1
 eval_iters = 5
@@ -23,21 +23,20 @@ always_save_checkpoint = True
 init_from = 'scratch'
 
 # Data
-dataset = 'medical'  # Changed to medical dataset
-gradient_accumulation_steps = 1  # Must be 1 for differential privacy
-batch_size = 16  # Adjusted for medical data
+dataset = 'medical'
+batch_size = 16
 block_size = 1024
 
 # Model
 n_layer = 12
 n_head = 12
 n_embd = 768
-dropout = 0.1  # Increased dropout for better generalization
+dropout = 0.1
 bias = False
 
 # AdamW optimizer
-learning_rate = 5e-4  # Slightly reduced learning rate
-max_iters = 1000  # Increased iterations for medical data
+learning_rate = 5e-4
+max_iters = 1000
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
@@ -45,7 +44,7 @@ grad_clip = 1.0
 
 # Learning rate decay settings
 decay_lr = True
-warmup_iters = 100  # Increased warmup
+warmup_iters = 100
 lr_decay_iters = 800
 min_lr = 5e-5
 
@@ -54,68 +53,9 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 dtype = 'float32'
 compile = True
 
-# Differential Privacy Parameters (adjusted for medical data)
-use_dp = True
-target_epsilon = 3.0  # Stricter privacy budget for medical data
-target_delta = 1e-6  # Stricter delta for medical data
-max_grad_norm = 0.5  # Reduced gradient norm for tighter privacy
-noise_multiplier = 1.3  # Increased noise for better privacy
+# Training settings
 num_epochs = 2
 
-# -----------------------------------------------------------------------------
-# Advanced Privacy Engine
-class AdvancedPrivacyEngine:
-    def __init__(self, noise_multiplier, max_grad_norm, target_epsilon, target_delta, sample_rate):
-        self.noise_multiplier = noise_multiplier
-        self.max_grad_norm = max_grad_norm
-        self.target_epsilon = target_epsilon
-        self.target_delta = target_delta
-        self.sample_rate = sample_rate
-        self.steps = 0
-        self.rdp_orders = np.linspace(1.1, 10.9, 100)
-        self.accumulated_rdp_noises = np.zeros_like(self.rdp_orders)
-    
-    def _compute_rdp(self, sigma, order):
-        if sigma == 0:
-            return float('inf')
-        return order / (2 * (sigma ** 2))
-    
-    def accumulate_privacy_loss(self, sample_rate):
-        for i, order in enumerate(self.rdp_orders):
-            rdp_noise = self._compute_rdp(self.noise_multiplier, order) * sample_rate
-            self.accumulated_rdp_noises[i] += rdp_noise
-    
-    def compute_epsilon(self):
-        eps_candidates = []
-        for i, order in enumerate(self.rdp_orders):
-            eps = self.accumulated_rdp_noises[i] - np.log(self.target_delta) / (order - 1)
-            eps_candidates.append(eps)
-        return float(min(eps_candidates))
-    
-    def step(self, sample_rate):
-        self.steps += 1
-        self.accumulate_privacy_loss(sample_rate)
-
-def clip_and_add_noise(model, max_norm, noise_multiplier, device):
-    total_norm = 0.0
-    for param in model.parameters():
-        if param.grad is not None:
-            param_norm = param.grad.data.norm(2)
-            total_norm += param_norm.item() ** 2
-    total_norm = math.sqrt(total_norm)
-    
-    clip_coef = max_norm / (total_norm + 1e-6)
-    if clip_coef < 1:
-        for param in model.parameters():
-            if param.grad is not None:
-                param.grad.data.mul_(clip_coef)
-    
-    for param in model.parameters():
-        if param.grad is not None:
-            noise = torch.randn_like(param.grad) * noise_multiplier * max_norm
-            param.grad.add_(noise)
-
-# -----------------------------------------------------------------------------
 # Initialize training
 master_process = not int(os.environ.get('RANK', -1)) != -1
 seed = 1337
@@ -134,15 +74,12 @@ class MedicalDataset(torch.utils.data.Dataset):
         data_file = 'train.bin' if split == 'train' else 'val.bin'
         self.data = np.memmap(os.path.join(data_dir, data_file), dtype=np.uint16, mode='r')
         self.block_size = block_size
-        
-        # Calculate valid starting indices (accounting for block_size)
-        self.valid_indices = len(self.data) - block_size
+        self.length = len(self.data) - self.block_size
         
     def __len__(self):
-        return self.valid_indices
+        return self.length
     
     def __getitem__(self, idx):
-        # Ensure we don't split patient records
         block_data = self.data[idx:idx + self.block_size]
         x = torch.from_numpy(block_data[:-1].astype(np.int64))
         y = torch.from_numpy(block_data[1:].astype(np.int64))
@@ -194,19 +131,6 @@ if compile:
     print("Compiling model...")
     model = torch.compile(model)
 
-# Privacy Engine Initialization
-if use_dp:
-    total_samples = len(train_dataset)
-    sample_rate = batch_size / total_samples
-    privacy_engine = AdvancedPrivacyEngine(
-        noise_multiplier=noise_multiplier,
-        max_grad_norm=max_grad_norm,
-        target_epsilon=target_epsilon,
-        target_delta=target_delta,
-        sample_rate=sample_rate
-    )
-    print(f"Initialized Privacy Engine with ε={target_epsilon}, δ={target_delta}")
-
 # Training loop
 def train_epoch(epoch):
     model.train()
@@ -227,15 +151,6 @@ def train_epoch(epoch):
         # Backward pass
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        
-        # Apply differential privacy if enabled
-        if use_dp:
-            clip_and_add_noise(model, max_grad_norm, noise_multiplier, device)
-            privacy_engine.step(sample_rate)
-            
-            if iter % log_interval == 0:
-                current_epsilon = privacy_engine.compute_epsilon()
-                print(f"Step {iter}: ε = {current_epsilon:.2f}, δ = {target_delta}")
         
         # Gradient clipping
         if grad_clip > 0:
@@ -275,16 +190,9 @@ try:
             os.makedirs(out_dir, exist_ok=True)
             torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
         
-        if use_dp:
-            final_epsilon = privacy_engine.compute_epsilon()
-            print(f"Epoch {epoch} Privacy Budget: ε = {final_epsilon:.2f}, δ = {target_delta}")
+        print(f"Epoch {epoch} completed. Loss: {train_loss:.4f}")
 
 except KeyboardInterrupt:
     print("Training interrupted by user")
 
-finally:
-    if use_dp:
-        final_epsilon = privacy_engine.compute_epsilon()
-        print(f"Final Privacy Guarantees: ε = {final_epsilon:.2f}, δ = {target_delta}")
-    
-    print("Training completed!")
+print("Training completed!")
