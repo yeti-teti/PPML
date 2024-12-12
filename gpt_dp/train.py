@@ -36,7 +36,7 @@ bias = True  # Added bias terms back
 
 # Optimizer improvements
 learning_rate = 5e-5  # Much smaller learning rate
-max_iters = 5000  # More iterations
+max_iters = 1000  # More iterations
 weight_decay = 0.01  # Reduced weight decay
 beta1 = 0.9
 beta2 = 0.999
@@ -62,7 +62,7 @@ target_epsilon = 10.0  # Slightly higher epsilon for better utility
 target_delta = 1e-5
 max_grad_norm = 0.5  # Reduced gradient norm
 noise_multiplier = 0.6  # Reduced noise
-num_epochs = 5  # More epochs
+num_epochs = 2  # More epochs
 
 torch.manual_seed(1337)
 torch.backends.cuda.matmul.allow_tf32 = True
